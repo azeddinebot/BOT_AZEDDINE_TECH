@@ -3,14 +3,13 @@
 const fs = require('fs');
 const path = require('path');
 const pino = require('pino');
-const qrcode = require('qrcode-terminal');
 
+const qrcode = require('qrcode-terminal');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion,
-  jidNormalizedUser
+  fetchLatestBaileysVersion
 } = require('@whiskeysockets/baileys');
 
 const CONFIG = require('./src/config');
@@ -18,7 +17,7 @@ const { loadJSON, saveJSON } = require('./src/lib/store');
 const { safeSendText, isGroup, pickText } = require('./src/lib/utils');
 const { buildCommandMap, parseCommand } = require('./src/lib/commands');
 
-const logger = pino({ level: 'silent' }); // خففنا الضجيج داخل Replit
+const logger = pino({ level: 'silent' });
 
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
@@ -58,19 +57,30 @@ async function startBot() {
     logger,
     auth: state,
     printQRInTerminal: false,
-    browser: ['BOT_AZEDDINE_TECH', 'Replit', '2.0.0']
+    mobile: false, // Ensure mobile is false for pairing code
+    browser: ["Ubuntu", "Chrome", "20.0.04"] // Standard browser string often helps with pairing
   });
+
+  if (!sock.authState.creds.registered) {
+    if (CONFIG.AUTO_PAIR && CONFIG.PAIR_NUMBER) {
+      setTimeout(async () => {
+        try {
+          const code = await sock.requestPairingCode(CONFIG.PAIR_NUMBER);
+          console.log('🔗 Pairing Code:', code);
+          console.log('واتساب > الإعدادات > الأجهزة المرتبطة > إدخال رمز');
+        } catch (e) {
+          console.log('⚠️ فشل طلب Pairing Code:', e?.message || e);
+        }
+      }, 5000);
+    } else {
+      console.log('⚠️ لم يتم تحديد PAIR_NUMBER في Secrets');
+    }
+  }
 
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      // QR بديل (بعض الحالات)
-      qrcode.generate(qr, { small: true });
-      console.log('✅ QR تم عرضه في الكونسول (إن ظهر).');
-    }
 
     if (connection === 'close') {
       const reason = lastDisconnect?.error?.output?.statusCode;
@@ -79,7 +89,7 @@ async function startBot() {
       console.log('❌ الاتصال انغلق. السبب:', reason);
       if (shouldReconnect) {
         console.log('🔄 إعادة تشغيل البوت...');
-        startBot().catch(console.error);
+        setTimeout(() => startBot().catch(console.error), 5000); // Add a small delay
       } else {
         console.log('⚠️ تم تسجيل الخروج. احذف مجلد auth_info وأعد الربط.');
       }
@@ -87,17 +97,8 @@ async function startBot() {
 
     if (connection === 'open') {
       console.log('✅ تم تشغيل البوت بنجاح!');
-      if (CONFIG.AUTO_PAIR && CONFIG.PAIR_NUMBER) {
-        try {
-          // Pairing code (بدون QR)
-          const code = await sock.requestPairingCode(CONFIG.PAIR_NUMBER);
-          console.log('🔗 Pairing Code:', code);
-          console.log('افتح واتساب > الأجهزة المرتبطة > ربط جهاز > أدخل الكود.');
-        } catch (e) {
-          console.log('⚠️ فشل طلب Pairing Code:', e?.message || e);
-        }
-      }
     }
+
   });
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
@@ -110,19 +111,15 @@ async function startBot() {
 
     const chatId = msg.key.remoteJid;
     const sender = msg.key.participant || chatId;
-    const senderN = (sender || '').split('@')[0];
 
-    // نص الرسالة (إن وجد)
     const text = pickText(msg.message);
     if (!text) return;
 
-    // Anti-spam بسيط (لأوامر)
     const parsed = parseCommand(text, CONFIG.PREFIX);
     if (!parsed.isCommand) return;
 
-    // cooldown عام للأوامر
     if (isOnCooldown(sender, 'cmd_global', CONFIG.COOLDOWN_MS)) {
-      return safeSendText(sock, chatId, `⏳ انتظر قليلًا قبل إرسال أمر جديد.`, msg);
+      return safeSendText(sock, chatId, '⏳ انتظر قليلًا قبل إرسال أمر جديد.', msg);
     }
 
     const { command, args } = parsed;
@@ -132,14 +129,14 @@ async function startBot() {
       return safeSendText(sock, chatId, `❓ أمر غير معروف. اكتب ${CONFIG.PREFIX}menu`, msg);
     }
 
-    // صلاحيات
     const group = isGroup(chatId);
     const owner = isOwner(sender);
+
     if (cmd.ownerOnly && !owner) {
-      return safeSendText(sock, chatId, `⛔ هذا الأمر خاص بالمالك فقط.`, msg);
+      return safeSendText(sock, chatId, '⛔ هذا الأمر خاص بالمالك فقط.', msg);
     }
     if (cmd.groupOnly && !group) {
-      return safeSendText(sock, chatId, `👥 هذا الأمر يعمل داخل المجموعات فقط.`, msg);
+      return safeSendText(sock, chatId, '👥 هذا الأمر يعمل داخل المجموعات فقط.', msg);
     }
 
     db.stats.commands++;
@@ -151,7 +148,6 @@ async function startBot() {
         msg,
         chatId,
         sender,
-        senderN,
         text,
         args,
         prefix: CONFIG.PREFIX,
@@ -162,11 +158,11 @@ async function startBot() {
       });
     } catch (e) {
       console.log('❌ خطأ أثناء تنفيذ الأمر:', e?.message || e);
-      await safeSendText(sock, chatId, `⚠️ حدث خطأ أثناء تنفيذ الأمر.`, msg);
+      await safeSendText(sock, chatId, '⚠️ حدث خطأ أثناء تنفيذ الأمر.', msg);
     }
   });
 
-  // ترحيب/وداع (اختياري وبسيط)
+  // ترحيب/وداع
   sock.ev.on('group-participants.update', async (ev) => {
     try {
       if (!db.group.welcome) return;
@@ -182,7 +178,6 @@ async function startBot() {
     } catch {}
   });
 
-  // حماية من الكراش
   process.on('unhandledRejection', (err) => console.log('unhandledRejection:', err));
   process.on('uncaughtException', (err) => console.log('uncaughtException:', err));
 }
